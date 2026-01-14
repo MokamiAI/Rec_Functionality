@@ -3,8 +3,8 @@ from fastapi import FastAPI, HTTPException, Response
 # -----------------------------
 # SCRAPING (company-name based)
 # -----------------------------
-from app.scraper.company_name_scraper import scrape_by_company_name
-
+from app.scraper.search import search_company_products
+from app.scraper.page_scraper import scrape_public_page
 # -----------------------------
 # INGESTION
 # -----------------------------
