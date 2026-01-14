@@ -11,3 +11,4 @@ pytesseract
 pandas
 scikit-learn
 mlflow
+urllib3
