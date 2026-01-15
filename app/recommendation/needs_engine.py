@@ -1,77 +1,76 @@
 # app/recommendation/needs_engine.py
 
+import os
+import requests
 from typing import List, Dict
 
 
 # =====================================================
-# PROVIDER RESOLUTION (SOUTH AFRICA)
+# SUPABASE CONNECTION
 # =====================================================
 
-def resolve_provider(policy_type: str) -> str:
-    """
-    Returns a South African insurance provider
-    relevant to the policy type.
-    """
-    mapping = {
-        "Life Insurance": "Sanlam",
-        "Funeral Cover": "AVBOB",
-        "Accidental Cover": "Old Mutual",
-        "Vehicle Insurance": "OUTsurance",
-        "Home & Contents Insurance": "Santam"
-    }
-    return mapping.get(policy_type, "Insurance Provider")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json"
+}
 
 
 # =====================================================
-# CONFIDENCE SCORING (USER-INPUT BASED)
+# FETCH RECOMMENDATION PRODUCTS (RULES)
 # =====================================================
 
-def calculate_confidence(profile: dict, policy_type: str) -> int:
-    score = 50
+def fetch_recommendation_products() -> List[Dict]:
+    url = f"{SUPABASE_URL}/rest/v1/recommendation_products?is_active=eq.true"
+    res = requests.get(url, headers=HEADERS)
+    res.raise_for_status()
+    return res.json()
 
+
+# =====================================================
+# RULE APPLICABILITY CHECK
+# =====================================================
+
+def rule_applies(rule: dict, profile: dict) -> bool:
+    age = profile["age"]
     income = profile["monthly_income"]
-    dependants = profile["dependants"]
-    owns_car = profile["owns_car"]
-    owns_home = profile["owns_home"]
 
-    if policy_type == "Life Insurance":
-        if dependants > 0:
-            score += 30
-        if income >= 15_000:
-            score += 10
+    if rule.get("min_age") and age < rule["min_age"]:
+        return False
+    if rule.get("max_age") and age > rule["max_age"]:
+        return False
+    if rule.get("min_monthly_income") and income < rule["min_monthly_income"]:
+        return False
+    if rule["requires_dependants"] and profile["dependants"] == 0:
+        return False
+    if rule["requires_car"] and not profile["owns_car"]:
+        return False
+    if rule["requires_home"] and not profile["owns_home"]:
+        return False
 
-    elif policy_type == "Funeral Cover":
-        score += 30
-        if dependants > 0:
-            score += 10
+    return True
 
-    elif policy_type == "Accidental Cover":
-        if income > 0:
-            score += 25
 
-    elif policy_type == "Vehicle Insurance":
-        if owns_car:
-            score += 40
+# =====================================================
+# CONFIDENCE CALCULATION (FROM TABLE)
+# =====================================================
 
-    elif policy_type == "Home & Contents Insurance":
-        if owns_home:
-            score += 35
-        if income >= 20_000:
-            score += 5
+def calculate_confidence(rule: dict, profile: dict) -> int:
+    score = rule["base_confidence"]
+
+    # Dependants bonus
+    score += profile["dependants"] * rule.get("confidence_per_dependant", 0)
+
+    # Income bonus
+    threshold = rule.get("confidence_income_threshold")
+    bonus = rule.get("confidence_income_bonus", 0)
+    if threshold and profile["monthly_income"] >= threshold:
+        score += bonus
 
     return min(score, 100)
-
-
-# =====================================================
-# PRIORITY BAND (CARD BADGE)
-# =====================================================
-
-def derive_priority_band(confidence_score: int) -> str:
-    if confidence_score >= 85:
-        return "best"
-    elif confidence_score >= 70:
-        return "medium"
-    return "optional"
 
 
 # =====================================================
@@ -84,7 +83,7 @@ def personalise_why_it_matters(profile: dict) -> List[str]:
     age = profile["age"]
     income = profile["monthly_income"]
 
-    # Age-based messaging
+    # Age-based
     if age <= 25:
         reasons.append("Well suited to your age group")
     elif 26 <= age <= 40:
@@ -92,7 +91,7 @@ def personalise_why_it_matters(profile: dict) -> List[str]:
     else:
         reasons.append("Important protection as responsibilities grow")
 
-    # Budget-based messaging
+    # Budget-based
     if income <= 10_000:
         reasons.append("Designed to fit a tight budget")
     elif income <= 30_000:
@@ -104,136 +103,60 @@ def personalise_why_it_matters(profile: dict) -> List[str]:
 
 
 # =====================================================
+# COVER & PREMIUM CALCULATION
+# =====================================================
+
+def calculate_cover_and_premium(rule: dict, profile: dict):
+    annual_income = profile["monthly_income"] * 12
+
+    if rule.get("fixed_cover_amount") is not None:
+        cover = rule["fixed_cover_amount"]
+    elif rule.get("cover_multiplier") is not None:
+        cover = annual_income * rule["cover_multiplier"]
+    else:
+        cover = None
+
+    if rule.get("fixed_premium_amount") is not None:
+        premium = rule["fixed_premium_amount"]
+    elif rule.get("premium_rate") is not None and cover is not None:
+        premium = round(cover * rule["premium_rate"], 2)
+    else:
+        premium = None
+
+    return cover, premium
+
+
+# =====================================================
 # NEEDS-BASED RECOMMENDATION ENGINE
 # =====================================================
 
 def recommend_policies(profile: dict) -> List[Dict]:
-    recommendations = []
-
-    monthly_income = profile["monthly_income"]
-    annual_income = monthly_income * 12
-    dependants = profile["dependants"]
-
+    rules = fetch_recommendation_products()
     personalised_reasons = personalise_why_it_matters(profile)
 
-    # -------------------------------------------------
-    # LIFE INSURANCE
-    # -------------------------------------------------
-    if dependants > 0:
-        cover = annual_income * 10
-        confidence = calculate_confidence(profile, "Life Insurance")
+    recommendations = []
+
+    for rule in rules:
+        if not rule_applies(rule, profile):
+            continue
+
+        confidence = calculate_confidence(rule, profile)
+
+        if confidence < rule["min_confidence_to_show"]:
+            continue
+
+        cover, premium = calculate_cover_and_premium(rule, profile)
 
         recommendations.append({
-            "policy_type": "Life Insurance",
-            "provider_name": resolve_provider("Life Insurance"),
+            "policy_type": rule["policy_type"],
+            "provider_name": rule["provider_name"],
             "confidence_score": confidence,
-            "priority_band": derive_priority_band(confidence),
+            "priority_band": rule["priority_band"],
             "recommended_cover": cover,
-            "estimated_monthly_premium": round(cover * 0.0015, 2),
-            "best_for": [
-                "People with dependants",
-                "Households relying on a main income"
-            ],
+            "estimated_monthly_premium": premium,
+            "best_for": rule["best_for"],
             "why_it_matters": [
-                "Provides long-term financial protection",
-                "Helps cover living costs, debt, and education",
-                *personalised_reasons
-            ]
-        })
-
-    # -------------------------------------------------
-    # FUNERAL COVER (ALWAYS INCLUDED)
-    # -------------------------------------------------
-    funeral_cover = 50_000 + (dependants * 25_000)
-    confidence = calculate_confidence(profile, "Funeral Cover")
-
-    recommendations.append({
-        "policy_type": "Funeral Cover",
-        "provider_name": resolve_provider("Funeral Cover"),
-        "confidence_score": confidence,
-        "priority_band": derive_priority_band(confidence),
-        "recommended_cover": funeral_cover,
-        "estimated_monthly_premium": round(funeral_cover * 0.002, 2),
-        "best_for": [
-            "All households",
-            "Families with dependants"
-        ],
-        "why_it_matters": [
-            "Covers immediate funeral expenses",
-            "Pays out quickly when cash is needed",
-            *personalised_reasons
-        ]
-    })
-
-    # -------------------------------------------------
-    # ACCIDENTAL COVER
-    # -------------------------------------------------
-    if monthly_income > 0:
-        cover = annual_income * 5
-        confidence = calculate_confidence(profile, "Accidental Cover")
-
-        recommendations.append({
-            "policy_type": "Accidental Cover",
-            "provider_name": resolve_provider("Accidental Cover"),
-            "confidence_score": confidence,
-            "priority_band": derive_priority_band(confidence),
-            "recommended_cover": cover,
-            "estimated_monthly_premium": round(cover * 0.002, 2),
-            "best_for": [
-                "Young professionals",
-                "Active individuals"
-            ],
-            "why_it_matters": [
-                "Covers accidental injury and disability",
-                "Protects your income if you cannot work",
-                *personalised_reasons
-            ]
-        })
-
-    # -------------------------------------------------
-    # VEHICLE INSURANCE
-    # -------------------------------------------------
-    if profile["owns_car"]:
-        confidence = calculate_confidence(profile, "Vehicle Insurance")
-
-        recommendations.append({
-            "policy_type": "Vehicle Insurance",
-            "provider_name": resolve_provider("Vehicle Insurance"),
-            "confidence_score": confidence,
-            "priority_band": derive_priority_band(confidence),
-            "recommended_cover": "Market value of the vehicle",
-            "estimated_monthly_premium": round(monthly_income * 0.03, 2),
-            "best_for": [
-                "Vehicle owners",
-                "Daily commuters"
-            ],
-            "why_it_matters": [
-                "Protects against accidents and theft",
-                "Avoids large, unexpected repair costs",
-                *personalised_reasons
-            ]
-        })
-
-    # -------------------------------------------------
-    # HOME & CONTENTS INSURANCE
-    # -------------------------------------------------
-    if profile["owns_home"]:
-        confidence = calculate_confidence(profile, "Home & Contents Insurance")
-
-        recommendations.append({
-            "policy_type": "Home & Contents Insurance",
-            "provider_name": resolve_provider("Home & Contents Insurance"),
-            "confidence_score": confidence,
-            "priority_band": derive_priority_band(confidence),
-            "recommended_cover": "Replacement value of home and contents",
-            "estimated_monthly_premium": round(monthly_income * 0.02, 2),
-            "best_for": [
-                "Homeowners",
-                "Property investors"
-            ],
-            "why_it_matters": [
-                "Protects your home and belongings",
-                "Safeguards your biggest financial asset",
+                *rule["base_why_it_matters"],
                 *personalised_reasons
             ]
         })
